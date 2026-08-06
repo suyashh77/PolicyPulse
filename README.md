@@ -1,317 +1,295 @@
 # PolicyPulse
 
-**A multi-agent consumer simulation framework for pre-launch retail policy validation**
+**A multi-agent consumer simulation for pre-launch retail return-policy validation.**
 
-> Built as a companion to my Returns Routing Project — a pre-movement return routing system for mid-market DTC apparel and footwear brands. PolicyPulse answers the question that optimization models can't: *will consumers actually accept the policy you're recommending?*
+A returns-routing optimiser tells you what is *cheapest*. It produces recommendations like "charge $9.95 for mail-in returns beyond 10 miles" that are correct on an expected-value basis and can still be commercially catastrophic, because an EV calculator has no term for a Reddit thread. PolicyPulse models the other half of the question: **will customers accept it?**
 
----
+It generates 500 persona-driven consumer agents, hits them with a proposed policy, and simulates 45 days of social reaction — feed exposure, opinion contagion, influencer amplification, churn.
 
-## Background & Motivation
-
-My return routing project proposes a 3-layer pre-movement system that fires at return label generation to intelligently route returns across a brand's fulfillment network. The model recommends actions like:
-
-- **In-store routing** — if the customer is within 10 miles of a store, route the return there (free for the customer, cheaper for the brand)
-- **Paid non-store returns** — if the nearest node is a DC or 3PL, charge a nominal shipping fee rather than absorbing it
-- **Keepit gate** — if the item's expected recovery value is below the cost of return logistics, offer the customer a keepit instead
-
-These recommendations are operationally sound. But they carry an implicit assumption: *that consumers will accept them.* A policy that is financially optimal but behaviorally unacceptable is not actually optimal — it drives churn, social backlash, and brand damage that never shows up in an EV calculator.
-
-To validate these assumptions before recommending them to brands, I built **PolicyPulse**: a multi-agent social simulation platform that models how different consumer segments respond to retail policy changes in a simulated social environment — before those policies go live.
+> **Status: working prototype, not validated.** The simulation responds correctly to its inputs and the dynamics are coherent, but the parameters are priors rather than fitted values and no backtest against real policy launches exists yet. Output is directional intuition, not evidence. See [Honest limitations](#honest-limitations).
 
 ---
 
-## What PolicyPulse Does
+## Contents
 
-PolicyPulse takes a proposed retail policy change as input, generates 500 AI agents with distinct consumer personas, and simulates 45 days of social reaction on Reddit. It produces a structured report showing:
-
-- Sentiment trajectory over 45 days post-announcement
-- Churn probability by consumer segment
-- Whether a negative cascade event occurred, and on which day
-- How different fee levels compare across independent runs
-- Why individual agents made the decisions they made (agent interview)
-
-The core claim is that emergent group dynamics — the pile-on, the counter-narrative, the influencer amplification — are fundamentally different from the sum of individual stated preferences. Traditional research tools (focus groups, surveys, A/B tests) capture the latter. PolicyPulse models the former.
+- [Quick start](#quick-start)
+- [The problem it solves](#the-problem-it-solves)
+- [How it works](#how-it-works)
+- [Architecture](#architecture)
+- [What's good about it](#whats-good-about-it)
+- [What's bad about it](#whats-bad-about-it)
+- [Honest limitations](#honest-limitations)
+- [What's left to build](#whats-left-to-build)
+- [Lessons learned](#lessons-learned)
+- [Project layout](#project-layout)
 
 ---
 
-## Simulation Architecture
+## Quick start
 
-PolicyPulse is built on top of [MiroFish](https://github.com/666ghj/MiroFish), an open-source multi-agent prediction engine developed by Guo Hongjian and backed by Shanda Group. MiroFish's simulation engine is [OASIS](https://arxiv.org/abs/2411.11581) (Open Agent Social Interaction Simulations) from the CAMEL-AI team, which supports up to 1 million agents and 23 distinct social actions.
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # add ANTHROPIC_API_KEY for the interview tab
 
-PolicyPulse adds a retail-specific configuration layer on top:
+streamlit run ui/app.py       # ~0.6s per simulation run
 
-```
-Input Layer
-  └── Policy type selection (v1: 3 supported types)
-  └── Policy variables (fee amount, distance threshold, item value threshold)
-  └── Brand context (positioning, current policy)
-  └── Seed data (Reddit sentiment scrape for brand)
-
-Knowledge Graph (Neo4j)
-  └── Entity extraction from seed material
-  └── Relationship mapping: brand ↔ policy ↔ consumer segments ↔ competitors
-
-Agent Generation (500 agents per run)
-  └── Persona library (5 retail archetypes)
-  └── Individual trait assignment per archetype
-  └── Persistent memory initialization (Zep Cloud)
-  └── Initial state: policy_sentiment = 0, churn_intent = 0
-
-Simulation Engine — 45 rounds (1 round = 1 day)
-  └── Round 1: all agents see pinned announcement post (sentiment = 0)
-  └── Rounds 2–45: feed algorithm + posting + state update
-  └── Platform: Reddit only (v1)
-
-ReportAgent (Claude Sonnet)
-  └── Sentiment curve (per-round average across all agents)
-  └── Churn probability by segment (round 45 snapshot)
-  └── Cascade detection (sentiment drop >0.4 in 10 consecutive rounds)
-  └── Threshold comparison across fee-level runs
-  └── Agent interview (filter by persona type + churn status)
+python -m pytest -q           # 71 tests, ~85s
 ```
 
+Note `python -m pytest`, not bare `pytest` — the executable is not on PATH in most setups here.
+
+Only `ANTHROPIC_API_KEY` is needed for anything currently wired up. The Reddit and Neo4j variables in `.env.example` correspond to scaffolded modules with no call sites.
+
 ---
 
-## Core Simulation Logic
+## The problem it solves
 
-### Agent State
+A survey asks 500 people what they think of a $9.95 return fee and averages the answers. That captures stated individual preference. It cannot capture the mechanism that actually determines outcomes: one micro-influencer post reaching 80,000 people, a deal-seeker cohort amplifying it, and a pile-on producing a brand-level result that nothing in the individual responses predicted.
 
-Each agent tracks two independent dimensions updated every round:
+PolicyPulse models *dynamics* rather than *preferences* — amplification, echo chambers, and threshold effects. That is the part traditional research genuinely cannot do.
 
-| Dimension | Range | Description |
-|---|---|---|
-| `policy_sentiment` | −1.0 to +1.0 | Opinion of the policy itself |
-| `churn_intent` | 0.0 to 1.0 | Likelihood to stop shopping with the brand |
-
-The two dimensions are independent. An agent can find a fee unfair (policy_sentiment: −0.6) while still having low churn intent (0.1) due to brand loyalty. In v1, churn_intent only increases — brand response mechanics that bring it back down are a v2 feature.
-
-### State Update Rules (per round)
+### Where it fits
 
 ```
-policy_sentiment += weighted_feed_signal × persona_susceptibility
-churn_intent     += max(0, −sentiment_delta) × churn_elasticity
-
-# Bounds
-policy_sentiment = clamp(policy_sentiment, −1.0, 1.0)
-churn_intent     = clamp(churn_intent, 0.0, 1.0)
-```
-
-Where:
-- `weighted_feed_signal` = sentiment-weighted average of posts seen this round
-- `sentiment_delta` = change in policy_sentiment this round (negative = got worse)
-- `persona_susceptibility` = how much peer opinion moves this archetype
-- `churn_elasticity` = how quickly negative sentiment converts to churn intent
-
-### Feed Algorithm (per agent per round)
-
-Each agent sees 10 posts per round, sampled from the post pool as follows:
-
-| Source | Weight | Rationale |
-|---|---|---|
-| Reach-weighted | 60% | High-follower posts dominate feeds naturally |
-| Homophily | 20% | Agents cluster with similar personas, echo chambers form |
-| Recency-weighted | 10% | Newest posts get a boost (Reddit hot/new algorithm) |
-| Random | 10% | Cross-cohort exposure, prevents total isolation |
-
-### Posting Behavior
-
-Each round, agents decide whether to post based on their archetype's frequency, then generate a post with sentiment drawn from their current state plus persona-specific noise:
-
-```
-post_sentiment = current_policy_sentiment + noise(persona_variance)
-```
-
-| Persona | Post probability / round | Variance |
-|---|---|---|
-| Micro-influencer | 100% | 0.1 (measured, deliberate) |
-| Deal-seeker | 40% | 0.3 (amplified, reactive) |
-| Sustainability buyer | 25% | 0.2 |
-| Casual shopper | 20% | 0.15 |
-| Loyal customer | 15% | 0.1 (moderate, restrained) |
-
-### Initial Conditions
-
-- All agents: `policy_sentiment = 0`, `churn_intent = 0`
-- Round 1: pinned announcement post (sentiment = 0) visible to all agents
-- Feed algorithm active from round 2 onward
-
----
-
-## Consumer Persona Library (v1)
-
-The persona library is PolicyPulse's primary contribution on top of raw MiroFish. Five archetypes, each with distinct susceptibility and elasticity parameters:
-
-| Archetype | Susceptibility | Churn Elasticity | Social Reach |
-|---|---|---|---|
-| Loyal customer | 0.2 | 0.1 | Low |
-| Casual shopper | 0.45 | 0.35 | Low–medium |
-| Deal-seeker | 0.8 | 0.6 | Medium |
-| Micro-influencer | 0.5 | 0.3 | High (10K–100K followers) |
-| Sustainability buyer | 0.55 | 0.4 | Medium |
-
-Each archetype is also configured with purchase behavior parameters (frequency, AOV, return rate) and social behavior parameters (follower count range, platform preference) that ground the agent's persona in realistic consumer behavior.
-
----
-
-## v1 Policy Types
-
-v1 supports three fixed policy types with structured variable inputs. v2 will introduce a generalized framework for arbitrary policy text once proof of concept is established.
-
-### Type A: Distance-gated routing
-
-**Policy**: Free in-store return if customer is within X miles of a store. Non-store (mail-in) return costs $Y.
-
-**Variables**:
-- Distance threshold: 5 / 10 / 15 / 25 miles
-- Fee amount: $4.95 / $7.95 / $9.95 / $12.95
-
-**Connection to returns project**: Directly validates the 10-mile routing rule in v4.0 L3 optimizer.
-
-### Type B: Flat return fee
-
-**Policy**: All mail-in returns carry a $Y fee deducted from refund. In-store returns remain free.
-
-**Variables**:
-- Fee amount: $4.95 / $7.95 / $9.95 / $12.95
-
-**Connection to returns project**: Validates the cost-sharing assumption in the EV calculator.
-
-### Type C: Keepit gate
-
-**Policy**: Items under $Z in value receive a full refund with no return required (keepit).
-
-**Variables**:
-- Item value threshold: $15 / $25 / $35 / $50
-
-**Connection to returns project**: Directly validates the keepit pre-gate condition: `max(EV) < shipping cost`.
-
-### Independent runs
-
-Each variable combination is a separate, independent simulation run. There is no bleed between runs. Comparison across runs (e.g. $4.95 vs $9.95 vs $12.95) is handled by the ReportAgent's threshold analysis.
-
----
-
-## ReportAgent Output Spec
-
-After each run, the ReportAgent produces:
-
-1. **Sentiment curve** — per-round average `policy_sentiment` across all 500 agents, plotted over 45 days
-2. **Churn by segment** — average `churn_intent` per persona archetype at round 45
-3. **Cascade flag** — boolean: did `policy_sentiment` drop >0.4 within any 10 consecutive rounds? If yes, which day did it trigger?
-4. **Threshold comparison** — across all fee-level runs for this policy type, side-by-side sentiment and churn at round 45
-5. **Agent interview** — user filters by persona type and churn status ("show me a deal-seeker who churned"), ReportAgent returns that agent's memory-grounded explanation of their behavior
-
----
-
-## Sample Output
-
-```
-PolicyPulse Report — Type A: Distance-gated routing ($9.95 non-store fee, 10-mile threshold)
-Generated: 2025-04-01 | Agents: 500 | Rounds: 45 | Platform: Reddit
-
-SENTIMENT CURVE
-  Day 1:   0.00  (announcement, neutral baseline)
-  Day 10: −0.18  (deal-seeker cohort vocal)
-  Day 20: −0.22  (peak negativity)
-  Day 35: −0.14  (stabilization)
-  Day 45: −0.11  (net slightly negative, no cascade)
-
-CASCADE EVENT: None triggered
-
-CHURN INTENT BY SEGMENT (day 45)
-  Loyal customer:       4.2%
-  Casual shopper:       11.7%
-  Deal-seeker:          34.1%   ← primary risk cohort
-  Micro-influencer:     8.9%
-  Sustainability buyer: 6.1%
-
-THRESHOLD COMPARISON (Type A, 10-mile threshold)
-  $4.95  — sentiment: −0.04 | avg churn: 3.1%  | cascade: No
-  $7.95  — sentiment: −0.09 | avg churn: 7.4%  | cascade: No
-  $9.95  — sentiment: −0.11 | avg churn: 11.2% | cascade: No
-  $12.95 — sentiment: −0.31 | avg churn: 24.6% | cascade: Yes (day 18)
-
-AGENT INTERVIEW
-  Filter: deal-seeker, churned
-
-  Agent #247: "I saw multiple people saying the same thing — why should I
-  pay $10 to return something that didn't fit? I already paid for shipping
-  to get it here. I checked Vuori and they still do free returns. I placed
-  an order there instead."
-```
-
----
-
-## Versioning Roadmap
-
-| Version | Scope |
-|---|---|
-| v1 | 3 policy types, 500 agents, 45 rounds, Reddit only, structured variable input |
-| v2 | Brand response mid-simulation (churn recovery), Twitter + news sources added |
-| v3 | Generalized policy input (arbitrary text), broader social ecosystem |
-
----
-
-## Validation Approach
-
-A simulation is only useful if it tracks reality. PolicyPulse's validation strategy:
-
-1. **Historical backtesting** — run simulations against known policy changes with documented social responses:
-   - H&M paid returns launch (2022) — significant documented backlash
-   - Zara return fee introduction (2022) — measured brand sentiment shift
-   - Lululemon Like New program — largely positive response
-   - Amazon keepit policy expansion — minimal consumer backlash
-
-2. **Accuracy metric** — compare simulated sentiment direction and cascade occurrence against observed Reddit data from the actual launch. Target: directional accuracy ≥ 80% across backtested cases.
-
-3. **Calibration loop** — use backtest deltas to adjust persona susceptibility and elasticity parameters iteratively.
-
----
-
-## Tech Stack
-
-| Layer | Tool |
-|---|---|
-| Simulation engine | MiroFish / OASIS (CAMEL-AI) |
-| Agent memory | Zep Cloud |
-| Knowledge graph | Neo4j |
-| Seed data | PRAW (Reddit scraper) |
-| Backend | Python / FastAPI |
-| UI | Streamlit |
-| Visualization | Plotly |
-| ReportAgent LLM | Claude Sonnet (Anthropic API) |
-| Local fallback | Ollama + Qwen2.5:32B |
-| Embeddings | nomic-embed-text |
-
-## Connection to Return Routing Project
-
-PolicyPulse is a validation layer that sits above the operational recommendation engine in the return routing project:
-
-```
-Return Routing v4.0
-  L1: Condition estimator (multinomial logistic, F1=0.58)
-  L2: EV calculator: EV(j) = Σₖ P(k) × [R(j,k) − T(j) − P(j,k)]
-  L3: ILP optimizer (PuLP)
+Return Routing optimiser
+  L1: condition estimator      →  what state will the item come back in?
+  L2: EV calculator             →  what is each disposition worth?
+  L3: ILP optimiser             →  what is the cheapest routing?
   Pre-gate: keepit if max(EV) < shipping cost
 
-          ↓  generates policy recommendation
+          ↓  emits a policy recommendation
 
 PolicyPulse
   "Will consumers accept this recommendation?"
-  Type A → validates distance-gated routing rule
-  Type B → validates cost-sharing fee assumption
-  Type C → validates keepit pre-gate threshold
+  Type A → validates the distance-gated routing rule
+  Type B → validates the cost-sharing fee assumption
+  Type C → validates the keepit threshold
 ```
 
-The routing optimizer determines what to do economically. PolicyPulse determines whether consumers will accept it behaviorally.
+### Realistic applications
+
+- **Fee-level selection** — find the sentiment cliff between $7.95 and $9.95 before committing.
+- **Segment risk** — identify which cohort carries the exposure, and whether it is one you can afford to lose.
+- **Comparative screening** — rank policy types A/B/C against each other under the same assumptions.
+- **Internal argument** — a defensible artefact for pushing back on a finance-driven fee proposal.
 
 ---
 
-## Acknowledgements
+## How it works
 
-- **MiroFish** by Guo Hongjian (666ghj) — the simulation engine this project builds on
-- **OASIS** by the CAMEL-AI team — the underlying multi-agent social interaction framework
-- **Zep Cloud** — persistent agent memory infrastructure
-- Stanford HAI Generative Agents paper (Park et al., 2023) — foundational research on believable agent behavior
+### 1. The policy becomes a per-segment shock
+
+This is the core of the model, in [`core/policy_impact.py`](core/policy_impact.py). Fees are judged **relative to basket size**, not in absolute dollars — $9.95 is a fifth of a deal seeker's $45 order and a sixteenth of a loyal customer's $165 one. Relative cost passes through a saturating disutility curve, because a $50 fee is not five times as infuriating as a $10 one, it is simply unacceptable either way.
+
+```
+disutility = fee_sensitivity × tanh(relative_cost / DISUTILITY_SCALE)
+```
+
+Each policy type has its own structure:
+
+| Type | Structure | Shock |
+|---|---|---|
+| **A** Distance-gated | Free in-store within X miles, $Y mail-in | Store coverage rises with radius; the uncovered fraction pays the fee, the covered fraction pays a small trip friction |
+| **B** Flat fee | $Y on all mail-in, in-store free | Same form, but coverage is capped at the persona's baseline store access — no distance gate to widen |
+| **C** Keepit | Items under $Z refunded, no return | **Positive** for most personas, scaled by the fraction of orders that qualify |
+
+Type C is the interesting one: `keepit_affinity` is **negative** for the sustainability cohort, who read "keep it, we'll refund you anyway" as manufactured waste rather than a gift. It is the one policy whose day-1 shock splits the population by sign — and watching what happens next is the point. Under a $50 threshold the sustainability cohort starts at −0.19 while everyone else starts positive; by day 45 social pressure has dragged them to **+0.17**, still the lowest segment and the only one with any churn at all. A dissenting minority getting partially converted by a positive majority is exactly the emergent dynamic a survey cannot produce.
+
+### 2. 500 agents are generated
+
+From [`config/personas.yaml`](config/personas.yaml), each starting at their persona's shock rather than at zero:
+
+| Archetype | Count | Susceptibility | Churn elasticity | AOV | Reach | Posts/round |
+|---|---|---|---|---|---|---|
+| Loyal | 150 | 0.20 | 0.10 | $165 | 50–500 | 15% |
+| Casual | 125 | 0.45 | 0.35 | $85 | 50–1K | 20% |
+| Deal seeker | 100 | 0.80 | 0.60 | $45 | 100–5K | 40% |
+| Micro-influencer | 50 | 0.50 | 0.30 | $120 | 10K–100K | **100%** |
+| Sustainability | 75 | 0.55 | 0.40 | $110 | 200–8K | 25% |
+
+### 3. Day 1 — the announcement
+
+A single pinned post whose sentiment is the population-weighted shock. The news itself reads as bad or good in proportion to how the customer base receives it.
+
+### 4. Days 2–45 — the contagion loop
+
+Each day, every agent: **samples a 10-post feed → updates state → maybe posts**. Posts written on day *N* are not visible until day *N+1*.
+
+**Feed algorithm** ([`core/feed.py`](core/feed.py)) — four mechanisms, mirroring how a real feed distributes attention:
+
+| Source | Slots | Rationale |
+|---|---|---|
+| Reach-weighted | 6 | Loud voices dominate feeds naturally |
+| Homophily | 2 | Agents cluster with similar personas; echo chambers form |
+| Recency | 1 | Newest posts get a boost |
+| Random | 1 | Cross-cohort exposure prevents total isolation |
+
+Reach decays 0.75× per round of age, and posts older than 12 rounds leave the pool entirely — real feeds have a half-life.
+
+**State update** ([`core/agent.py`](core/agent.py)) — two independent dimensions:
+
+```
+social_pull  = (feed_signal − sentiment) × susceptibility
+anchor_pull  = (baseline   − sentiment) × anchor_strength
+sentiment   += social_pull + anchor_pull            → clamp [−1, +1]
+
+target_churn = max(0, −sentiment) × churn_elasticity
+churn       += (target_churn − churn) × rate         → clamp [0, 1]
+               (rate = elasticity when rising, churn_recovery when falling)
+```
+
+Sentiment moves *toward* the feed signal rather than accumulating it, and each agent is pulled partway back toward its policy-implied baseline. Churn tracks the sentiment **level** and can recover, escalating faster than it decays — people forgive gradually.
+
+Keeping sentiment and churn separate is deliberate: an agent can find a fee unfair (−0.6) and still not leave (churn 0.1) out of brand loyalty.
+
+### 5. Reporting
+
+Deterministic, no LLM. Sentiment curve with a ±1σ band across seeds, day-45 churn by segment, cascade detection (a >0.4 drop within any 10-day window), and a threshold comparison grouped by policy setting.
+
+### 6. Agent interview — the only LLM call
+
+Filter for "a deal seeker who churned", and Claude reads that agent's 45-day memory log and voices it in first person.
 
 ---
+
+## Architecture
+
+```
+Input          Policy type + variables (A/B/C)
+                 ↓
+core/policy_impact.py   → per-persona sentiment shock      ← the model's judgment layer
+                 ↓
+core/agent.py           → 500 agents seeded at their shock
+                 ↓
+core/simulation.py      → 45 rounds; per-round feed index
+   └── core/feed.py     → 6/2/1/1 sampling with reach decay
+                 ↓
+report/                 → curves, cascade, threshold comparison   (deterministic)
+   └── interview.py     → Claude voices one agent                 (the only LLM call)
+                 ↓
+ui/app.py               → Streamlit + Plotly
+report/persistence.py   → runs saved to runs/*.json
+```
+
+Keeping the LLM out of the aggregation path is deliberate. Deterministic numbers with one narrow generative surface means results are reproducible; most projects in this space over-use the model and end up unable to reproduce their own figures.
+
+---
+
+## What's good about it
+
+- **The abstraction is right.** Separating `policy_sentiment` from `churn_intent` is the single best modelling decision here. Collapsing them into one number — the obvious shortcut — would destroy the model's usefulness.
+- **The feed algorithm is the strongest code in the project.** The 6/2/1/1 split across reach, homophily, recency, and random is well-reasoned, handles degenerate pools, redistributes unfilled slots, and guarantees no duplicates.
+- **Type C reveals a genuine segment split, then resolves it.** Sustainability buyers start negative on keepit while every other segment starts positive, and the majority partly converts them over 45 days. That trajectory is emergent, not special-cased.
+- **The signal now dominates the noise.** Across 10 seeds, the fee ladder moves sentiment monotonically from −0.080 ($4.95) to −0.144 ($12.95) with a per-seed standard deviation of 0.008 — roughly an 8:1 signal-to-noise ratio, and every seed agrees on the sign.
+- **Clean module boundaries.** `core` / `report` / `data` / `ui` separate cleanly with `TYPE_CHECKING` imports avoiding circularity. The reporting layer or UI could be swapped without touching `core`.
+- **Reproducible by construction.** Every run carries its seed; the same seed reproduces bit-identically.
+- **Results are reported with spread, not as point estimates.** Given a per-run standard deviation around 0.02–0.08, a single run is not evidence, and the UI does not present it as one.
+- **Fast.** ~0.6s per 45-round run, so a 10-seed batch is interactive.
+- **The tests assert behaviour, not just shape.** `tests/test_policy_impact.py` checks that a $12.95 fee ends more negative than a $4.95 one — the property the whole system exists to model.
+
+## What's bad about it
+
+- **Every parameter is a prior.** `DISUTILITY_SCALE = 0.25`, the AOVs, the sensitivities, the store-access fractions — all are reasoned guesses, not fitted values. The model's *structure* is defensible; its *calibration* is not yet evidence-based.
+- **No validation against reality.** H&M and Zara both introduced return fees in 2022 with a public record of the response. Until the tool reproduces known outcomes, it is an argument, not a measurement.
+- **The social graph is implicit.** Homophily is approximated by persona matching rather than a real follower network. Agents have reach but no edges, so there are no communities, no bridges, and no structural holes.
+- **Reach is static.** A post that goes viral does not gain reach, and an influencer whose take is ignored does not lose any.
+- **No brand response.** The brand announces once and then goes silent for 45 days. Real brands walk policies back, clarify, or issue apologies — the single most important missing dynamic.
+- **Personas are homogeneous within a segment.** All 100 deal seekers share identical susceptibility and elasticity; only reach and the noise draw vary. Real segments have internal distributions.
+- **Two scaffolded modules with zero call sites.** `data/seeder.py` and `data/graph_builder.py` are defined, documented, and never called.
+- **Sentiment is one-dimensional.** "How do you feel about this policy" collapses fairness, convenience, and value into a single scalar, which is why an agent can't be annoyed at the fee but pleased about the in-store option.
+
+---
+
+## Honest limitations
+
+**Read this before quoting a number from this tool.**
+
+1. **Unvalidated.** No backtest exists. The parameters were reasoned, not measured.
+2. **Directional, not quantitative.** "Deal seekers react ~3× more sharply than loyal customers to a flat fee" is the kind of claim the model supports. "11.2% of deal seekers will churn" is not — that number is an artefact of the elasticity constants fed in.
+3. **The rank ordering is more trustworthy than the magnitudes.** That $12.95 hurts more than $4.95, and that deal seekers absorb the most damage, are structural results. The size of the gap is a parameter choice.
+4. **Churn intent is not churn.** It is a latent propensity in [0, 1], not a probability, and it has never been mapped to observed behaviour.
+5. **45 days is an assumption.** So are 500 agents, the 10-post feed, and the 12-round post lifetime.
+
+---
+
+## What's left to build
+
+Ordered by what unblocks the most.
+
+### Validation — the highest-value work remaining
+
+1. **Backtesting harness.** Run against documented policy changes with known outcomes: H&M paid returns (2022, significant backlash), Zara return fee (2022, measured sentiment shift), Lululemon Like New (largely positive), Amazon keepit expansion (minimal backlash). Target: ≥80% directional accuracy.
+2. **Parameter fitting.** Use backtest error to fit `DISUTILITY_SCALE`, the per-persona sensitivities, and the AOVs instead of asserting them.
+3. **Churn calibration.** Map `churn_intent` onto observed post-policy retention so the number means something.
+
+### Modelling
+
+4. **Brand response mid-simulation** — walk-backs, clarifications, apologies. The biggest missing dynamic.
+5. **An explicit social graph** — replace persona-matched homophily with a real follower network so communities and bridges exist.
+6. **Within-segment heterogeneity** — draw susceptibility and elasticity from distributions rather than assigning a constant.
+7. **Engagement-driven reach** — let posts gain or lose reach based on reaction.
+8. **Multi-dimensional sentiment** — separate fairness, convenience, and value.
+
+### Data pipeline
+
+9. **Wire up `data/seeder.py`.** Uncomment the VADER path and use scraped brand sentiment as the pre-policy baseline instead of assuming neutrality.
+10. **Wire up or delete `data/graph_builder.py`.** It currently writes a graph nothing reads. Either query it during simulation or cut it and drop the Neo4j dependency.
+
+### Product
+
+11. **Sensitivity sweeps** — run the full fee ladder automatically and plot the response curve rather than making the user run each level by hand.
+12. **Export** — CSV/PDF reports for sharing outside the app.
+13. **Confidence guidance in the UI** — surface when the seed spread is wide enough that the run count is too low to conclude anything.
+
+---
+
+## Lessons learned
+
+**Passing tests measured the wrong thing.** An earlier version had a green suite alongside a simulation that ignored its primary input entirely — every test asserted structure (500 agents, 45 rounds, no duplicate posts) and none asserted the causal property the system exists to model. The single most valuable test here is three lines: run at $4.95, run at $12.95, assert the results differ. Structural tests prove code runs; behavioural tests prove it means something.
+
+**A parameter that is stored but never read is invisible to every check.** `policy_variables` flowed through the function signature, onto the dataclass, into the report, and onto the screen — present everywhere it could be *seen* and absent from the one place it had to be *used*. Type checkers passed, tests passed, the UI displayed the value back to you. Data flowing *into* a system is not the same as data affecting a system, and only executing with varied inputs distinguishes them.
+
+**Plausible output is more dangerous than broken output.** A crash gets fixed immediately. A smooth sentiment curve that renders beautifully and is pure RNG can be screenshotted into a deck. Polish actively concealed the defect, because a chart that looks like a result gets read as one. Anything producing numbers for decisions needs a way to fail loudly — which is why runs now carry seeds and charts now carry error bands.
+
+**Verify with a distinguishing experiment, not by reading.** The simulation loop *looked* correct: state updates matched the spec, the feed algorithm was genuinely well-built. The defect only became undeniable on running the same seed against three different policies and getting byte-identical output. The question is never "does this look right" but "what observation would differ if it were broken" — then make that observation.
+
+**Building the periphery before the core inverts the risk order.** The feed algorithm, persona library, UI, interview, and cascade detector were all completed to spec while the policy→sentiment mapping — the one component that is genuinely hard and can't be copied from a spec — was deferred to a hardcoded `0.0`. That is the natural order to build in, because the periphery is well-defined and satisfying. It also means a lot of finished work whose value was gated on a piece that was never started. Prototype the riskiest, least-specified component first, even crudely.
+
+**The fix for a runaway feedback loop is usually the update rule, not a bound.** Sentiment used to *accumulate* the feed signal (`+= signal × susceptibility`), which has no fixed point — a persistently positive feed marched every agent to +1 and the clamp was the only thing stopping divergence. Moving a *fraction of the remaining distance* toward the signal converges instead. A model whose only equilibrium is its own boundary is not modelling anything.
+
+**One-directional state variables accumulate noise into signal.** Churn integrated only downward sentiment deltas and never recovered, so symmetric noise ratcheted it upward indefinitely and a population could end up simultaneously delighted and increasingly likely to leave. Anything that can only rise will eventually max out on nothing at all; if a quantity should be able to recover in reality, it needs a decay path in the model.
+
+**Aspirational documentation decays into inaccurate documentation.** An earlier README described the intended system in the present tense — claiming a MiroFish-backed, Zep-memory, Neo4j-graph, LLM-agent platform, next to a fabricated sample output. Nothing was dishonest at the time of writing; the roadmap and the state diverged and the tense never moved. Roadmap belongs in the future tense or a separate section, and illustrative output needs to be labelled at the point of reading.
+
+**Graceful degradation can hide non-existence.** `build_knowledge_graph()` returns immediately without `NEO4J_URI`, which reads as robust engineering. Combined with having no call sites at all, the effect was a component that appeared operational, never errored, and did nothing. A no-op fallback should still be reachable and observable, or the absence becomes structurally undetectable.
+
+**Performance work paid for correctness work.** Feed sampling rescanned a growing pool once per agent per round — ~375M operations, 70 seconds per run. Hoisting the per-round work into a shared index cut it to 0.6s. That 117× speedup is what makes multi-seed batches viable, and multi-seed batches are what make the output honest. The optimisation wasn't a nicety; it was the precondition for reporting uncertainty at all.
+
+---
+
+## Project layout
+
+```
+config/personas.yaml      5 archetypes: social + economic parameters
+core/
+  policy_impact.py        policy + variables + persona → sentiment shock   ← the judgment layer
+  policy_types.py         A/B/C definitions and announcement templates
+  agent.py                Agent/Post models, state update, posting
+  feed.py                 6/2/1/1 feed sampling with per-round index
+  simulation.py           45-round orchestration, seeding, batches
+report/
+  curves.py               sentiment curves, churn by segment, seed aggregation
+  cascade.py              sliding-window collapse detection
+  report_agent.py         assembles the report dict (no LLM)
+  interview.py            the only LLM call — voices one agent
+  persistence.py          save/load runs to runs/*.json
+data/                     SCAFFOLDS, no call sites
+  seeder.py               Reddit scraper (returns neutral 0.0)
+  graph_builder.py        Neo4j graph (nothing reads it)
+ui/app.py                 Streamlit: configure / results / interview
+tests/                    71 tests
+```
+
+### Acknowledgements
+
+- OASIS (CAMEL-AI) and the Stanford HAI Generative Agents paper (Park et al., 2023) as conceptual influences on agent-based social simulation. Neither is a dependency — the simulation engine here is homegrown.

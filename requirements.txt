@@ -1,12 +1,16 @@
-anthropic
-praw
-nltk
-neo4j
-zep-cloud
-streamlit
-plotly
-pandas
-numpy
-pyyaml
-python-dotenv
-pytest
+# Runtime
+anthropic>=0.40        # agent interview (the only LLM call in the project)
+streamlit>=1.30        # UI
+plotly>=5.18           # charts
+pandas>=2.0            # tables in the UI
+pyyaml>=6.0            # persona config
+python-dotenv>=1.0     # .env loading
+
+# Tests
+pytest>=8.0
+
+# Not yet wired into the simulation. Install these only if you are working on
+# data/seeder.py or data/graph_builder.py, which currently have no call sites:
+#   praw          # Reddit scraper for seed sentiment
+#   nltk          # VADER sentiment scoring for scraped posts
+#   neo4j         # knowledge-graph builder

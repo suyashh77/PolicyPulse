@@ -1,40 +1,90 @@
+# Consumer persona library.
+#
+# Social parameters (susceptibility, post_probability, ...) drive contagion.
+# Economic parameters (aov_usd, fee_sensitivity, ...) drive the policy shock
+# computed in core/policy_impact.py — they are what makes a $12.95 fee land
+# differently on a deal seeker than on a loyal customer.
+#
+# All values are priors, not measurements. They should be re-fit against the
+# historical cases listed in README.md ("Validation") before any output is
+# treated as evidence.
+
 personas:
   loyal:
-    susceptibility: 0.2
-    churn_elasticity: 0.1
+    # --- social ---
+    susceptibility: 0.20        # how far peer opinion pulls this archetype
+    churn_elasticity: 0.10      # how sharply negative sentiment converts to churn
+    churn_recovery: 0.04        # per-round rate churn intent decays when sentiment recovers
+    anchor_strength: 0.15       # pull back toward the policy-implied baseline
     post_probability: 0.15
     post_variance: 0.10
     reach_range: [50, 500]
     count_fraction: 0.30
+    # --- economic ---
+    aov_usd: 165                # average order value; fees are judged relative to this
+    fee_sensitivity: 0.30       # disutility ceiling for a fee that is large vs AOV
+    store_access: 0.60          # fraction who can realistically use in-store return
+    in_store_friction: 0.05     # mild annoyance at having to make the trip
+    keepit_affinity: 0.30       # delight at a "keep it, refunded anyway" offer
 
   casual:
     susceptibility: 0.45
     churn_elasticity: 0.35
+    churn_recovery: 0.03
+    anchor_strength: 0.10
     post_probability: 0.20
     post_variance: 0.15
     reach_range: [50, 1000]
     count_fraction: 0.25
+    aov_usd: 85
+    fee_sensitivity: 0.55
+    store_access: 0.45
+    in_store_friction: 0.10
+    keepit_affinity: 0.50
 
   deal_seeker:
     susceptibility: 0.80
     churn_elasticity: 0.60
+    churn_recovery: 0.02
+    anchor_strength: 0.06
     post_probability: 0.40
     post_variance: 0.30
     reach_range: [100, 5000]
     count_fraction: 0.20
+    aov_usd: 45                 # small baskets, so a flat fee is a large relative cost
+    fee_sensitivity: 0.85
+    store_access: 0.40
+    in_store_friction: 0.15
+    keepit_affinity: 0.80
 
   influencer:
     susceptibility: 0.50
     churn_elasticity: 0.30
+    churn_recovery: 0.03
+    anchor_strength: 0.10
     post_probability: 1.00
     post_variance: 0.10
     reach_range: [10000, 100000]
     count_fraction: 0.10
+    aov_usd: 120
+    fee_sensitivity: 0.50
+    store_access: 0.55
+    in_store_friction: 0.08
+    keepit_affinity: 0.45
 
   sustainability:
     susceptibility: 0.55
     churn_elasticity: 0.40
+    churn_recovery: 0.03
+    anchor_strength: 0.12
     post_probability: 0.25
     post_variance: 0.20
     reach_range: [200, 8000]
     count_fraction: 0.15
+    aov_usd: 110
+    fee_sensitivity: 0.45
+    store_access: 0.50
+    in_store_friction: 0.06
+    # Negative: this cohort reads "keep it, we'll refund you" as manufactured
+    # waste rather than a gift. Type C is the one policy they dislike.
+    keepit_affinity: -0.35

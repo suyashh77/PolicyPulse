@@ -9,6 +9,22 @@ if TYPE_CHECKING:
     from core.agent import Agent
     from core.simulation import SimulationRun
 
+MODEL = "claude-opus-5"
+
+# Thinking and response text share this budget. Opus 5 thinks by default, so a
+# tight cap would truncate the answer mid-sentence; the effort setting keeps the
+# spend down instead.
+MAX_TOKENS = 2000
+
+CHURN_THRESHOLD = 0.5
+
+SYSTEM_PROMPT = (
+    "You are a consumer who just experienced this return policy change. "
+    "Respond in first person, grounded in your memory of what you saw "
+    "and how you felt over the past 45 days. Be specific and human. "
+    "Do not describe yourself as a simulation or an agent."
+)
+
 
 def get_interview_candidates(
     run: SimulationRun,
@@ -24,43 +40,54 @@ def get_interview_candidates(
     for agent in run.agents:
         if agent.persona != persona:
             continue
-        if churned and agent.churn_intent >= 0.5:
+        if churned and agent.churn_intent >= CHURN_THRESHOLD:
             candidates.append(agent)
-        elif not churned and agent.churn_intent < 0.5:
+        elif not churned and agent.churn_intent < CHURN_THRESHOLD:
             candidates.append(agent)
     return candidates
 
 
-def interview_agent(
-    agent: Agent,
-    policy_variables: dict,
-    announcement_text: str,
-) -> str:
-    """Call Claude Sonnet API to generate a first-person agent interview response."""
-    last_memories = agent.memory[-10:] if len(agent.memory) >= 10 else agent.memory
+def _describe_memory(agent: Agent, n: int = 10) -> str:
+    """Render the agent's recent rounds as readable lines rather than raw dicts."""
+    recent = agent.memory[-n:]
+    return "\n".join(
+        f"  Day {m['round']}: saw {len(m['posts_seen_ids'])} posts, "
+        f"felt {m['sentiment']:+.2f}, likelihood of leaving {m['churn_intent']:.2f}"
+        for m in recent
+    )
 
+
+def interview_agent(agent: Agent, announcement_text: str) -> str:
+    """Ask Claude to voice one agent's 45-day experience of the policy.
+
+    The only LLM call in the project. Everything in the reporting path is
+    deterministic.
+    """
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        system=(
-            "You are a consumer who just experienced this return policy change. "
-            "Respond in first person, grounded in your memory of what you saw "
-            "and how you felt over the past 45 days. Be specific and human."
-        ),
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        output_config={"effort": "low"},
+        system=SYSTEM_PROMPT,
         messages=[
             {
                 "role": "user",
                 "content": (
-                    f"Policy announced: {announcement_text}\n"
-                    f"Your memory log: {last_memories}\n"
-                    f"Final sentiment: {agent.policy_sentiment:.2f}\n"
-                    f"Final churn intent: {agent.churn_intent:.2f}\n"
-                    f"Explain your reaction to this policy in 3-4 sentences."
+                    f"Policy announced: {announcement_text}\n\n"
+                    f"Your recent experience:\n{_describe_memory(agent)}\n\n"
+                    f"Your starting reaction to the policy was "
+                    f"{agent.baseline_sentiment:+.2f} on a -1 to +1 scale.\n"
+                    f"Final sentiment: {agent.policy_sentiment:+.2f}\n"
+                    f"Final likelihood of leaving the brand: {agent.churn_intent:.2f}\n\n"
+                    "Explain your reaction to this policy in 3-4 sentences."
                 ),
             }
         ],
     )
 
-    return message.content[0].text
+    if response.stop_reason == "refusal":
+        return "(The model declined to generate a response for this agent.)"
+
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    return text or "(No response text returned.)"

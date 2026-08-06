@@ -1,28 +1,95 @@
 from __future__ import annotations
 
+import itertools
 import random
+from dataclasses import dataclass, field
 
 from core.agent import Agent, Post
 
+FEED_SIZE = 10
+REACH_SLOTS = 6
+HOMOPHILY_SLOTS = 2
+RECENCY_SLOTS = 1
+RANDOM_SLOTS = 1
 
-def sample_feed(agent: Agent, post_pool: list[Post], round_num: int) -> list[Post]:
+# A post's pull on the reach-weighted bucket decays each round. Without this,
+# day-45 feeds were still dominated by day-2 posts and the simulation carried
+# enormous inertia from opinions nobody held any more.
+REACH_DECAY_PER_ROUND = 0.75
+
+
+@dataclass
+class FeedIndex:
+    """Per-round precomputation shared across all 500 agents.
+
+    `sample_feed` previously rebuilt several filtered lists per agent per round
+    over a pool that grew to ~7,000 posts — roughly 375M operations per run.
+    Everything that does not depend on the agent is hoisted here and computed
+    once per round instead.
     """
-    Return exactly 10 posts for this agent this round.
+
+    round_num: int
+    posts: list[Post]
+    by_persona: dict[str, list[Post]] = field(default_factory=dict)
+    reach_cum_weights: list[float] = field(default_factory=list)
+    recency_candidates: list[Post] = field(default_factory=list)
+    recency_cum_weights: list[float] = field(default_factory=list)
+
+
+def build_feed_index(post_pool: list[Post], round_num: int) -> FeedIndex:
+    index = FeedIndex(round_num=round_num, posts=list(post_pool))
+
+    for post in index.posts:
+        index.by_persona.setdefault(post.persona, []).append(post)
+
+    # Reach weights, aged so recent posts dominate.
+    weights = []
+    for post in index.posts:
+        age = max(0, round_num - post.round)
+        weights.append(max(post.reach * (REACH_DECAY_PER_ROUND ** age), 1e-9))
+    index.reach_cum_weights = list(itertools.accumulate(weights))
+
+    # Recency bucket: current round weighted 2:1 against the prior round.
+    rec_weights = []
+    for post in index.posts:
+        if post.round == round_num:
+            rec_weights.append(2.0)
+        elif post.round == round_num - 1:
+            rec_weights.append(1.0)
+        else:
+            continue
+        index.recency_candidates.append(post)
+    index.recency_cum_weights = list(itertools.accumulate(rec_weights))
+
+    return index
+
+
+def sample_feed(agent: Agent, post_pool: list[Post], round_num: int,
+                index: FeedIndex | None = None) -> list[Post]:
+    """
+    Return up to 10 posts for this agent this round.
     If post_pool has fewer than 10 posts, return all available.
 
     Sampling breakdown (10 posts total):
-      6 posts  - reach-weighted (probability proportional to post.reach)
+      6 posts  - reach-weighted (probability proportional to aged post.reach)
       2 posts  - homophily (same persona as agent, uniform sample)
       1 post   - recency-weighted (current and prior round weighted 2:1)
       1 post   - random uniform
 
     No duplicates across the 4 buckets.
-    If a bucket can't be filled, redistribute remaining slots to reach-weighted.
+    If a bucket can't be filled, remaining slots go to the reach-weighted bucket.
+
+    `index` is the per-round precomputation from `build_feed_index`. It is
+    optional so the function stays usable standalone (and in tests); the
+    simulation always passes one.
     """
-    if len(post_pool) <= 10:
+    if len(post_pool) <= FEED_SIZE:
         return list(post_pool)
 
-    selected: set[int] = set()  # post ids already picked
+    if index is None or index.round_num != round_num:
+        index = build_feed_index(post_pool, round_num)
+
+    selected: set[int] = set()
     result: list[Post] = []
 
     def _add(post: Post) -> bool:
@@ -32,83 +99,60 @@ def sample_feed(agent: Agent, post_pool: list[Post], round_num: int) -> list[Pos
         result.append(post)
         return True
 
-    # --- Bucket 2: Homophily (2 posts) ---
-    homophily_target = 2
-    homophily_posts = [p for p in post_pool if p.persona == agent.persona]
+    # --- Homophily (2 posts) ---
     homophily_picked = 0
-    if homophily_posts:
-        random.shuffle(homophily_posts)
-        for p in homophily_posts:
-            if homophily_picked >= homophily_target:
+    same_persona = index.by_persona.get(agent.persona)
+    if same_persona:
+        for post in random.sample(same_persona, min(len(same_persona), HOMOPHILY_SLOTS * 3)):
+            if homophily_picked >= HOMOPHILY_SLOTS:
                 break
-            if _add(p):
+            if _add(post):
                 homophily_picked += 1
 
-    # --- Bucket 3: Recency-weighted (1 post) ---
-    recency_target = 1
+    # --- Recency-weighted (1 post) ---
     recency_picked = 0
-    current_round_posts = [p for p in post_pool if p.id not in selected and p.round == round_num]
-    prior_round_posts = [p for p in post_pool if p.id not in selected and p.round == round_num - 1]
-
-    recency_candidates: list[Post] = []
-    recency_weights: list[float] = []
-    for p in current_round_posts:
-        recency_candidates.append(p)
-        recency_weights.append(2.0)
-    for p in prior_round_posts:
-        recency_candidates.append(p)
-        recency_weights.append(1.0)
-
-    if recency_candidates and recency_weights:
-        picks = random.choices(recency_candidates, weights=recency_weights, k=1)
-        for p in picks:
-            if recency_picked >= recency_target:
+    if index.recency_candidates:
+        for post in random.choices(
+            index.recency_candidates,
+            cum_weights=index.recency_cum_weights,
+            k=RECENCY_SLOTS * 3,
+        ):
+            if recency_picked >= RECENCY_SLOTS:
                 break
-            if _add(p):
+            if _add(post):
                 recency_picked += 1
 
-    # --- Bucket 4: Random uniform (1 post) ---
-    random_target = 1
+    # --- Random uniform (1 post) ---
     random_picked = 0
-    available = [p for p in post_pool if p.id not in selected]
-    if available:
-        random.shuffle(available)
-        for p in available:
-            if random_picked >= random_target:
-                break
-            if _add(p):
-                random_picked += 1
+    for post in random.sample(index.posts, min(len(index.posts), RANDOM_SLOTS * 4)):
+        if random_picked >= RANDOM_SLOTS:
+            break
+        if _add(post):
+            random_picked += 1
 
-    # --- Redistribute unfilled slots to reach-weighted ---
-    reach_target = 6 + (homophily_target - homophily_picked) + (recency_target - recency_picked) + (random_target - random_picked)
-
-    # --- Bucket 1: Reach-weighted (6+ posts) ---
-    available = [p for p in post_pool if p.id not in selected]
-    if available and reach_target > 0:
-        reaches = [float(p.reach) for p in available]
-        total_reach = sum(reaches)
-        if total_reach > 0:
-            weights = [r / total_reach for r in reaches]
-        else:
-            weights = [1.0 / len(available)] * len(available)
-
-        # Sample with replacement then deduplicate
-        picks = random.choices(available, weights=weights, k=reach_target * 3)
-        reach_picked = 0
-        for p in picks:
+    # --- Reach-weighted, absorbing any unfilled slots ---
+    reach_target = (
+        REACH_SLOTS
+        + (HOMOPHILY_SLOTS - homophily_picked)
+        + (RECENCY_SLOTS - recency_picked)
+        + (RANDOM_SLOTS - random_picked)
+    )
+    reach_picked = 0
+    if reach_target > 0:
+        for post in random.choices(
+            index.posts, cum_weights=index.reach_cum_weights, k=reach_target * 4
+        ):
             if reach_picked >= reach_target:
                 break
-            if _add(p):
+            if _add(post):
                 reach_picked += 1
 
-        # If still short, fill from remaining
+        # Still short (heavy duplicate draws) — top up uniformly.
         if reach_picked < reach_target:
-            remaining = [p for p in post_pool if p.id not in selected]
-            random.shuffle(remaining)
-            for p in remaining:
+            for post in index.posts:
                 if reach_picked >= reach_target:
                     break
-                if _add(p):
+                if _add(post):
                     reach_picked += 1
 
-    return result[:10]
+    return result[:FEED_SIZE]

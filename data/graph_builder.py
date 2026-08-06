@@ -1,14 +1,24 @@
-"""Neo4j knowledge graph builder. Scaffold only in v1."""
+"""Neo4j knowledge graph builder.
+
+SCAFFOLD — this module has no call sites. Nothing in the simulation writes to
+or reads from the graph, so building it changes no output. Either wiring it in
+or removing it is listed under "What's left to build" in the README.
+
+`neo4j` is not in the default requirements, so the import is guarded.
+"""
 from __future__ import annotations
 
 import os
 
-from neo4j import GraphDatabase
+try:
+    from neo4j import GraphDatabase
+except ImportError:  # pragma: no cover - optional dependency
+    GraphDatabase = None
 
 from core.policy_types import POLICY_TYPES
 
 # Flag to run without Neo4j if unavailable
-NEO4J_ENABLED = bool(os.getenv("NEO4J_URI"))
+NEO4J_ENABLED = bool(os.getenv("NEO4J_URI")) and GraphDatabase is not None
 
 
 def build_knowledge_graph(

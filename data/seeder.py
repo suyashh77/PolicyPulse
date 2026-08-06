@@ -1,10 +1,27 @@
-"""Reddit scraper for seed data. Scaffold only in v1 — uses neutral seed."""
+"""Reddit scraper for seed data.
+
+SCAFFOLD — this module has no call sites. `run_simulation` does not use it, and
+`posts_to_seed_sentiment` returns a neutral 0.0 regardless of input. Wiring it
+up (so a brand's existing Reddit sentiment sets the pre-policy baseline instead
+of assuming neutrality) is listed under "What's left to build" in the README.
+
+`praw` and `nltk` are not in the default requirements, so the imports are
+guarded: importing this module never fails, but calling `scrape_reddit` without
+those packages raises with a clear message.
+"""
 from __future__ import annotations
 
 import os
 
-import praw
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+try:
+    import praw
+except ImportError:  # pragma: no cover - optional dependency
+    praw = None
+
+try:
+    from nltk.sentiment.vader import SentimentIntensityAnalyzer
+except ImportError:  # pragma: no cover - optional dependency
+    SentimentIntensityAnalyzer = None
 
 
 def scrape_reddit(
@@ -16,6 +33,9 @@ def scrape_reddit(
     Use PRAW to pull recent posts mentioning brand_name from given subreddits.
     Returns list of {title, body, score, created_utc, subreddit}.
     """
+    if praw is None:
+        raise ImportError("scrape_reddit requires `praw` (pip install praw)")
+
     if subreddits is None:
         subreddits = [
             "frugalmalefashion",

@@ -12,6 +12,7 @@ It generates 500 persona-driven consumer agents, hits them with a proposed polic
 
 ## Contents
 
+- [Case study](CASE_STUDY.md) — the full project narrative, decisions, and findings
 - [Quick start](#quick-start)
 - [The problem it solves](#the-problem-it-solves)
 - [How it works](#how-it-works)

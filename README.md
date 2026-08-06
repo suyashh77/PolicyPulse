@@ -32,12 +32,12 @@ It generates 500 persona-driven consumer agents, hits them with a proposed polic
 pip install -r requirements.txt
 cp .env.example .env          # add ANTHROPIC_API_KEY for the interview tab
 
-streamlit run ui/app.py       # ~0.6s per simulation run
+python -m streamlit run ui/app.py    # ~0.6s per simulation run
 
 python -m pytest -q           # 105 tests, ~36s (Tier 1 + Tier 2 logic; no API calls)
 ```
 
-Note `python -m pytest`, not bare `pytest` — the executable is not on PATH in most setups here.
+Use `python -m streamlit` and `python -m pytest` rather than the bare executables — neither is reliably on PATH.
 
 Only `ANTHROPIC_API_KEY` is needed for anything currently wired up. The Reddit and Neo4j variables in `.env.example` correspond to scaffolded modules with no call sites.
 

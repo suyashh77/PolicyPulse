@@ -1,0 +1,22 @@
+# Tier 2 (OASIS) — OPTIONAL, and a separate interpreter.
+#
+# camel-oasis requires Python >=3.10,<3.12. The project's main environment runs
+# 3.12, so Tier 2 lives in its own conda env:
+#
+#   conda create -n policypulse-oasis python=3.11 -y
+#   conda activate policypulse-oasis
+#   pip install -r requirements-oasis.txt
+#
+# Remove with: conda env remove -n policypulse-oasis
+
+camel-oasis==0.2.5
+
+# camel-ai 0.2.78 imports `FastMCP` from `mcp.server`, which mcp 2.0 removed.
+# Without this pin, `import oasis` fails at import time.
+mcp<2
+
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# CAMEL needs the provider SDK for whichever platform you use.
+anthropic>=0.40

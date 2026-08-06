@@ -33,7 +33,7 @@ cp .env.example .env          # add ANTHROPIC_API_KEY for the interview tab
 
 streamlit run ui/app.py       # ~0.6s per simulation run
 
-python -m pytest -q           # 71 tests, ~85s
+python -m pytest -q           # 105 tests, ~36s (Tier 1 + Tier 2 logic; no API calls)
 ```
 
 Note `python -m pytest`, not bare `pytest` — the executable is not on PATH in most setups here.
@@ -159,19 +159,50 @@ Input          Policy type + variables (A/B/C)
                  ↓
 core/policy_impact.py   → per-persona sentiment shock      ← the model's judgment layer
                  ↓
-core/agent.py           → 500 agents seeded at their shock
-                 ↓
-core/simulation.py      → 45 rounds; per-round feed index
-   └── core/feed.py     → 6/2/1/1 sampling with reach decay
-                 ↓
+       ┌─────────┴──────────────────────────────┐
+       ↓                                        ↓
+TIER 1 — numeric (default)            TIER 2 — OASIS LLM agents (optional)
+core/agent.py    500 agents           oasis_tier/profiles.py  personas → agents + follower graph
+core/feed.py     6/2/1/1 sampling     oasis_tier/runner.py    announcement + brand response
+core/simulation  45 rounds, 0.55s     oasis_tier/extract.py   posts → report
+                                      oasis_tier/cost.py      token metering + budget cap
+       └─────────┬──────────────────────────────┘
+                 ↓  (both emit the same report shape)
 report/                 → curves, cascade, threshold comparison   (deterministic)
-   └── interview.py     → Claude voices one agent                 (the only LLM call)
+   └── interview.py     → Claude voices one agent
                  ↓
 ui/app.py               → Streamlit + Plotly
 report/persistence.py   → runs saved to runs/*.json
 ```
 
-Keeping the LLM out of the aggregation path is deliberate. Deterministic numbers with one narrow generative surface means results are reproducible; most projects in this space over-use the model and end up unable to reproduce their own figures.
+Keeping the LLM out of the *aggregation* path is deliberate. Deterministic numbers with narrow generative surfaces means results are reproducible; most projects in this space over-use the model and end up unable to reproduce their own figures.
+
+### The two tiers
+
+|  | **Tier 1 — numeric** | **Tier 2 — OASIS** |
+|---|---|---|
+| Cost / run | free | $174–$529 at equivalent scale |
+| Speed | 0.55s | minutes |
+| Reproducible | bit-identical by seed | trace-logged only |
+| Reads announcement *text* | no | **yes** |
+| Social graph | persona-matched homophily | explicit follower edges |
+| Actions | post | post, comment, like, repost, follow… |
+| Use for | sweeps, calibration, CI | realism, copy testing, quotable output |
+
+Tier 1 is the workhorse; Tier 2 is the microscope. Running the same policy through both is the point — where they agree, Tier 1 can be swept cheaply; where they diverge is where the numeric model is wrong.
+
+**Tier 2 needs Python 3.11 and costs money**, so it lives in its own environment and is entirely optional:
+
+```bash
+conda create -n policypulse-oasis python=3.11 -y
+conda activate policypulse-oasis
+pip install -r requirements-oasis.txt
+python scripts/run_oasis_spike.py --agents 20 --days 5 --model claude-haiku-4-5 --budget 1.00
+```
+
+Full design rationale and measured cost findings: [docs/OASIS_INTEGRATION_PLAN.md](docs/OASIS_INTEGRATION_PLAN.md).
+
+**An early validation signal.** Told only *"your orders are usually small, so any added fee feels like a large share of what you spent"*, a Tier-2 deal-seeker agent wrote: *"$12.95 return fee?? When my average order is $25–40, that's 30–50% of what I spent!"* — that is `policy_impact.py`'s relative-cost disutility, re-derived independently by a language model. Two different methods converging on the same mechanism is the best evidence the abstraction is sound.
 
 ---
 
@@ -286,8 +317,15 @@ report/
 data/                     SCAFFOLDS, no call sites
   seeder.py               Reddit scraper (returns neutral 0.0)
   graph_builder.py        Neo4j graph (nothing reads it)
+oasis_tier/               TIER 2 - LLM agents on OASIS (optional, needs py3.11)
+  profiles.py             personas.yaml -> OASIS agents + follower graph
+  runner.py               announcement injection, brand response, manifest
+  extract.py              OASIS sqlite -> Tier-1-shaped report
+  cost.py                 token metering + hard budget cap
+scripts/run_oasis_spike.py  metered Tier-2 spike runner
+docs/OASIS_INTEGRATION_PLAN.md  design rationale + measured costs
 ui/app.py                 Streamlit: configure / results / interview
-tests/                    71 tests
+tests/                    105 tests (no API calls)
 ```
 
 ### Acknowledgements

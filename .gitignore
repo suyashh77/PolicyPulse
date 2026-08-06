@@ -39,3 +39,10 @@ ASSESSMENT.md
 
 # Saved simulation runs
 runs/
+
+# OASIS trace databases
+runs/oasis/
+*.db
+
+# OASIS writes runtime logs here
+log/

@@ -46,3 +46,9 @@ runs/oasis/
 
 # OASIS writes runtime logs here
 log/
+
+# Personal notes - never commit
+CASE_STUDY.md
+docs/
+*_WRITEUP.md
+*_explained.md

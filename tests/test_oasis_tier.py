@@ -305,3 +305,124 @@ class TestExtraction:
     def test_missing_database_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             extract_report(tmp_path / "nope.db")
+
+
+class TestValidateMetrics:
+    """Cross-tier agreement metrics."""
+
+    def test_perfect_agreement(self):
+        from oasis_tier.validate import TierComparison
+        c = TierComparison(["a", "b", "c"], [-0.5, -0.3, -0.1], [-0.9, -0.6, -0.2], [5, 5, 5]).to_dict()
+        assert c["pairwise_rank_agreement"] == 1.0
+        assert c["sign_agreement"] == 1.0
+        assert c["spearman_rho"] == pytest.approx(1.0)
+
+    def test_inverted_ordering_is_caught(self):
+        from oasis_tier.validate import TierComparison
+        c = TierComparison(["a", "b", "c"], [-0.5, -0.3, -0.1], [-0.1, -0.3, -0.5], [5, 5, 5]).to_dict()
+        assert c["pairwise_rank_agreement"] == 0.0
+        assert c["spearman_rho"] == pytest.approx(-1.0)
+
+    def test_sign_disagreement_detected(self):
+        from oasis_tier.validate import TierComparison
+        c = TierComparison(["a", "b"], [-0.2, -0.1], [-0.3, +0.4], [5, 5]).to_dict()
+        assert c["sign_agreement"] == 0.5
+
+    def test_level_gap_reported_not_penalised(self):
+        """Tier 2 is selection-biased toward strong feeling; levels should not match."""
+        from oasis_tier.validate import TierComparison
+        c = TierComparison(["a", "b", "c"], [-0.1, -0.2, -0.3], [-0.5, -0.6, -0.7], [9, 9, 9]).to_dict()
+        assert c["level_gap"] == pytest.approx(-0.4)
+        assert c["pairwise_rank_agreement"] == 1.0  # still agrees on structure
+
+    def test_thin_coverage_is_inconclusive_not_a_pass(self):
+        from oasis_tier.validate import compare_tiers
+
+        class FakeRun:
+            round_summaries = [{"breakdown_by_persona": {
+                "loyal": {"avg_sentiment": -0.1},
+                "deal_seeker": {"avg_sentiment": -0.5},
+            }}]
+
+        report = {"breakdown_by_persona": {
+            "loyal": {"avg_sentiment": -0.2, "n_posts": 1},
+            "deal_seeker": {"avg_sentiment": -0.6, "n_posts": 8},
+        }}
+        c = compare_tiers(FakeRun(), report, min_posts=2)
+        assert c["verdict"]["status"] == "inconclusive"
+        assert any(e["persona"] == "loyal" for e in c["excluded_personas"])
+
+
+class TestBatchScoringPlumbing:
+    def test_batch_scorer_is_used_when_available(self):
+        from oasis_tier.extract import _apply_scores
+        from oasis_tier.scoring import ScoredPost
+
+        class FakeBatchScorer:
+            def __init__(self):
+                self.calls = 0
+
+            def score_many(self, texts):
+                self.calls += 1
+                return [ScoredPost(-0.8, 0.7, "furious") for _ in texts]
+
+        posts = [{"content": "a"}, {"content": "b"}, {"content": "c"}]
+        scorer = FakeBatchScorer()
+        _apply_scores(posts, scorer)
+
+        assert scorer.calls == 1, "batch scorer should be called once, not per post"
+        assert all(p["sentiment"] == -0.8 for p in posts)
+        assert all(p["churn_intent"] == 0.7 for p in posts)
+        assert all(p["stance"] == "furious" for p in posts)
+
+    def test_per_text_scorer_still_works(self):
+        from oasis_tier.extract import _apply_scores
+
+        posts = [{"content": "unfair scam"}, {"content": "seems fair"}]
+        _apply_scores(posts, lambda t: -1.0 if "scam" in t else 1.0)
+        assert posts[0]["sentiment"] == -1.0
+        assert posts[1]["sentiment"] == 1.0
+        assert "churn_intent" not in posts[0]
+
+    def test_comments_are_included_as_utterances(self, sample_db):
+        """Scoring only posts threw away ~89% of what agents said."""
+        import sqlite3
+        from oasis_tier.extract import extract_report
+
+        con = sqlite3.connect(str(sample_db))
+        con.execute("DROP TABLE comment")
+        con.execute(
+            "CREATE TABLE comment (comment_id INTEGER PRIMARY KEY, post_id INTEGER, "
+            "user_id INTEGER, content TEXT, created_at DATETIME, num_likes INTEGER, "
+            "num_dislikes INTEGER)"
+        )
+        con.execute(
+            "INSERT INTO comment VALUES (1, 1, 3, 'Honestly this is fine, in-store is free', "
+            "'2026-01-04', 0, 0)"
+        )
+        con.commit(); con.close()
+
+        report = extract_report(sample_db)
+        assert report["n_comments"] == 1
+        assert report["n_original_posts"] == 3
+        assert report["n_utterances"] == 4
+        assert report["breakdown_by_persona"]["loyal"]["n_posts"] == 2
+
+    def test_reposts_counted_not_scored(self, tmp_path):
+        """Empty-content post rows are reposts; scoring them 0.0 drags means to neutral."""
+        import sqlite3
+        from oasis_tier.extract import extract_report
+
+        path = tmp_path / "r.db"
+        _make_oasis_db(path, {
+            "users": [(1, "deal_seeker_0")],
+            "posts": [
+                (1, 1, "outrageous unfair scam", "2026-01-01"),
+                (2, 1, "", "2026-01-02"),
+                (3, 1, "   ", "2026-01-03"),
+            ],
+        })
+        report = extract_report(path)
+        assert report["n_reposts"] == 2
+        assert report["n_utterances"] == 1
+        assert report["breakdown_by_persona"]["deal_seeker"]["avg_sentiment"] < -0.5

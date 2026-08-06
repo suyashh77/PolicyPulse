@@ -1,12 +1,15 @@
 """PolicyPulse Streamlit UI."""
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -42,8 +45,8 @@ if "runs" not in st.session_state:
 if "current_batch" not in st.session_state:
     st.session_state.current_batch = None
 
-tab_config, tab_results, tab_interview = st.tabs(
-    ["Configure Simulation", "Results", "Agent Interview"]
+tab_config, tab_results, tab_economics, tab_interview = st.tabs(
+    ["Configure Simulation", "Results", "Economics", "Agent Interview"]
 )
 
 # ===================== PAGE 1: CONFIGURE =====================
@@ -249,7 +252,192 @@ with tab_results:
                 "threshold comparison."
             )
 
-# ===================== PAGE 3: AGENT INTERVIEW =====================
+        # --- Tier 2: what agents actually said ---
+        st.subheader("What consumers actually said (Tier 2)")
+        tier2_reports = sorted(
+            Path("runs/oasis").glob("*_report.json"), reverse=True
+        ) if Path("runs/oasis").is_dir() else []
+
+        if not tier2_reports:
+            st.caption(
+                "No Tier-2 run found. Tier 2 puts LLM agents on a simulated Reddit "
+                "so you can read what people say, not just a curve. "
+                "See docs/OASIS_INTEGRATION_PLAN.md."
+            )
+        else:
+            t2 = json.loads(tier2_reports[0].read_text(encoding="utf-8"))
+            posts = [p for p in t2.get("posts", []) if p.get("content", "").strip()]
+            st.caption(
+                f"From `{tier2_reports[0].name}` — {len(posts)} utterances, "
+                f"Type {t2.get('policy_type')} {t2.get('policy_variables')}"
+            )
+            posts.sort(key=lambda p: p.get("sentiment", 0))
+            col_neg, col_pos = st.columns(2)
+            with col_neg:
+                st.markdown("**Most negative**")
+                for p in posts[:4]:
+                    st.markdown(
+                        f"> {p['content'][:400]}\n\n"
+                        f"— *{p['persona']}* · {p.get('sentiment', 0):+.2f}"
+                    )
+            with col_pos:
+                st.markdown("**Most positive**")
+                for p in reversed(posts[-4:]):
+                    st.markdown(
+                        f"> {p['content'][:400]}\n\n"
+                        f"— *{p['persona']}* · {p.get('sentiment', 0):+.2f}"
+                    )
+
+# ===================== PAGE 3: ECONOMICS =====================
+with tab_economics:
+    st.header("Economics")
+    st.caption(
+        "Translates sentiment and churn into money. Every figure below is "
+        "arithmetic over the brand inputs — change one and you can trace how the "
+        "output moved."
+    )
+
+    if not st.session_state.current_batch:
+        st.info("Run a simulation first to price it.")
+    else:
+        from core.economics import (
+            BrandProfile,
+            EconomicAssumptions,
+            build_frontier,
+            evaluate_policy,
+            sensitivity_to_churn_conversion,
+        )
+        from report.curves import aggregate_churn_by_segment
+
+        st.subheader("Brand inputs")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            customers = st.number_input("Active customers", 1_000, 50_000_000, 250_000, step=10_000)
+            aov = st.number_input("Average order value ($)", 10.0, 1000.0, 95.0)
+        with b2:
+            orders_py = st.number_input("Orders / customer / year", 0.5, 30.0, 3.2)
+            margin = st.slider("Gross margin", 0.05, 0.90, 0.45)
+        with b3:
+            return_rate = st.slider("Return rate", 0.01, 0.70, 0.28)
+            mail_share = st.slider("Mail-in share of returns", 0.05, 1.0, 0.55)
+
+        brand = BrandProfile(
+            active_customers=int(customers),
+            orders_per_customer_per_year=orders_py,
+            avg_order_value=aov,
+            gross_margin=margin,
+            return_rate=return_rate,
+            mail_in_share=mail_share,
+        )
+
+        conversion = st.slider(
+            "Churn conversion — share of churn *intent* that becomes a lost customer",
+            0.05, 1.0, 0.35,
+            help="The least defensible number in the model. It has never been "
+                 "mapped to observed behaviour. Check the sensitivity table below.",
+        )
+        assumptions = EconomicAssumptions(churn_conversion=conversion)
+
+        churn_now = {
+            k: v["mean"] for k, v in aggregate_churn_by_segment(batch).items()
+        }
+        result = evaluate_policy(
+            brand, run.policy_type, run.policy_variables,
+            churn_now, personas_config, assumptions,
+        )
+
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Gross annual saving", f"${result['gross_annual_saving']:,.0f}")
+        e2.metric("Customer value at risk", f"${result['clv_at_risk']:,.0f}")
+        e3.metric(
+            "Net", f"${result['net_value']:,.0f}",
+            delta=result["verdict"],
+            delta_color="normal" if result["net_value"] > 0 else "inverse",
+        )
+
+        # --- Frontier ---
+        st.subheader("Policy frontier")
+        st.caption("Where the savings stop covering the behavioural risk.")
+
+        var_name = list(POLICY_TYPES[run.policy_type]["variables"])[-1]
+        levels = POLICY_TYPES[run.policy_type]["variables"][var_name]
+
+        with st.spinner(f"Simulating each {var_name.replace('_',' ')} level..."):
+            churn_by_level = {}
+            for level in levels:
+                variables = dict(run.policy_variables)
+                variables[var_name] = level
+                level_runs = run_batch(
+                    run.policy_type, variables, seeds=[1, 2, 3, 4, 5],
+                    personas_config=personas_config,
+                )
+                churn_by_level[level] = {
+                    k: v["mean"] for k, v in aggregate_churn_by_segment(level_runs).items()
+                }
+
+            frontier = build_frontier(
+                brand, run.policy_type, var_name, levels, churn_by_level,
+                personas_config, base_variables=run.policy_variables,
+                assumptions=assumptions,
+            )
+
+        xs = [f["level"] for f in frontier]
+        fig_f = go.Figure()
+        fig_f.add_trace(go.Bar(
+            x=xs, y=[f["gross_annual_saving"] for f in frontier],
+            name="Gross saving", marker_color="#00CC96",
+        ))
+        fig_f.add_trace(go.Bar(
+            x=xs, y=[-f["clv_at_risk"] for f in frontier],
+            name="Customer value at risk", marker_color="#EF553B",
+        ))
+        fig_f.add_trace(go.Scatter(
+            x=xs, y=[f["net_value"] for f in frontier],
+            name="Net", mode="lines+markers",
+            line=dict(color="#111", width=3),
+        ))
+        fig_f.add_hline(y=0, line_dash="dot", line_color="gray")
+        fig_f.update_layout(
+            barmode="relative", height=440,
+            xaxis_title=var_name.replace("_", " ").title(),
+            yaxis_title="Annual $",
+        )
+        st.plotly_chart(fig_f, width="stretch")
+
+        safe = [f["level"] for f in frontier if f["net_value"] > 0]
+        if safe:
+            st.success(f"Value-accretive at: {', '.join(str(s) for s in safe)}")
+        else:
+            st.error(
+                f"No {var_name.replace('_',' ')} level is accretive at "
+                f"{conversion:.0%} churn conversion. Check the sensitivity below "
+                "before concluding the policy is unviable."
+            )
+
+        # --- Sensitivity ---
+        st.subheader("Sensitivity to the churn-conversion assumption")
+        st.caption(
+            "If the sign of Net flips inside this range, the recommendation is "
+            "not robust and should be presented as a range, not a number."
+        )
+        sens = sensitivity_to_churn_conversion(
+            brand, run.policy_type, run.policy_variables, churn_now, personas_config
+        )
+        st.dataframe(pd.DataFrame(sens), width="stretch", hide_index=True)
+
+        # --- Who carries the risk ---
+        st.subheader("Who carries the risk")
+        risk_rows = [
+            {"persona": p, **d} for p, d in result["risk_detail"]["by_segment"].items()
+        ]
+        st.dataframe(pd.DataFrame(risk_rows), width="stretch", hide_index=True)
+        st.caption(
+            "Loudest is not costliest: the segment that churns hardest may be the "
+            "cheapest to lose, while a quieter, higher-value cohort carries more."
+        )
+
+
+# ===================== PAGE 4: AGENT INTERVIEW =====================
 with tab_interview:
     st.header("Agent Interview")
 

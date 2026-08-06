@@ -186,6 +186,11 @@ async def _run_async(cfg: OasisRunConfig, personas_config: dict, shocks: dict[st
                 await env.step(step)
                 agent_steps += len(active)
 
+            # Re-check between steps. The in-backend check can be swallowed by
+            # CAMEL's per-agent error handling, so the loop we control is the
+            # only place the cap is reliably enforced.
+            meter.check_budget()
+
             timeline.append(
                 {
                     "day": day,

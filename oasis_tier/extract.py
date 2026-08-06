@@ -109,6 +109,27 @@ def _day_from_timestamp(value, day_index: dict) -> int:
     return day_index[value]
 
 
+def _apply_scores(posts: list[dict], scorer) -> None:
+    """Attach sentiment (and churn/stance when available) to each post in place.
+
+    Batches through `score_many` when the scorer offers it, so an LLM scorer
+    makes one call per ~20 posts instead of one call per post.
+    """
+    if not posts:
+        return
+
+    texts = [p["content"] for p in posts]
+
+    if hasattr(scorer, "score_many"):
+        for post, scored in zip(posts, scorer.score_many(texts)):
+            post["sentiment"] = scored.sentiment
+            post["churn_intent"] = scored.churn_intent
+            post["stance"] = scored.stance
+    else:
+        for post, text in zip(posts, texts):
+            post["sentiment"] = scorer(text)
+
+
 def extract_report(
     db_path: str | Path,
     manifest: dict | None = None,
@@ -118,6 +139,10 @@ def extract_report(
 
     Returns sentiment_curve, churn_by_segment, cascade and the raw posts, so the
     existing reporting layer and UI can consume a Tier-2 run unchanged.
+
+    `scorer` is either a per-text callable returning a float (the lexicon), or an
+    object exposing `score_many(list[str])` (the LLM scorer), in which case all
+    posts are scored in batches rather than one call each.
     """
     tables = load_run_tables(db_path)
 
@@ -128,23 +153,45 @@ def extract_report(
 
     day_index: dict = {}
     scored_posts = []
-    for row in sorted(tables["post"], key=lambda r: (r.get("created_at") or "", r["post_id"])):
+    n_reposts = 0
+
+    # Posts AND comments. On a 60-agent run OASIS produced 20 posts against 158
+    # comments - scoring only posts threw away 89% of what the agents said, and
+    # left whole personas (loyal, sustainability) with no measurable opinion
+    # because they reply far more than they post.
+    utterances = [
+        ("post", r, r.get("post_id")) for r in tables["post"]
+    ] + [
+        ("comment", r, r.get("comment_id")) for r in tables["comment"]
+    ]
+
+    for kind, row, row_id in sorted(
+        utterances, key=lambda t: (t[1].get("created_at") or "", t[2] or 0)
+    ):
         persona = persona_by_user.get(row["user_id"], "unknown")
         if persona == "brand":
             continue  # the brand's own posts are stimulus, not reaction
         content = row.get("content") or ""
+        if not content.strip():
+            # OASIS writes a post row with empty content for a repost. It is an
+            # amplification signal, not an opinion - scoring it as 0.0 would drag
+            # every persona mean toward neutral. Counted, not scored.
+            n_reposts += 1
+            continue
         scored_posts.append(
             {
-                "post_id": row["post_id"],
+                "kind": kind,
+                "post_id": row_id,
                 "user_id": row["user_id"],
                 "persona": persona,
                 "day": _day_from_timestamp(row.get("created_at"), day_index),
                 "content": content,
-                "sentiment": scorer(content),
                 "num_likes": row.get("num_likes", 0) or 0,
                 "num_dislikes": row.get("num_dislikes", 0) or 0,
             }
         )
+
+    _apply_scores(scored_posts, scorer)
 
     # --- sentiment curve: mean of posts made up to and including each day ---
     by_day: dict[int, list[float]] = defaultdict(list)
@@ -176,19 +223,32 @@ def extract_report(
     for persona, posts in persona_posts.items():
         sentiments = [p["sentiment"] for p in posts]
         mean = sum(sentiments) / len(sentiments) if sentiments else 0.0
-        # Churn proxy: share of this cohort's posts that mention leaving/switching.
-        leaving = sum(
-            1 for p in posts
-            if any(t in p["content"].lower()
-                   for t in ("cancel", "switch", "elsewhere", "never again",
-                             "done with", "stop shopping", "leaving"))
-        )
-        breakdown[persona] = {
+
+        # Churn: the LLM scorer judges intent directly. The keyword heuristic is
+        # the fallback when scoring was done with the lexicon.
+        if posts and "churn_intent" in posts[0]:
+            churn = sum(p["churn_intent"] for p in posts) / len(posts)
+        else:
+            leaving = sum(
+                1 for p in posts
+                if any(t in p["content"].lower()
+                       for t in ("cancel", "switch", "elsewhere", "never again",
+                                 "done with", "stop shopping", "leaving"))
+            )
+            churn = leaving / len(posts) if posts else 0.0
+
+        entry = {
             "avg_sentiment": round(mean, 4),
             "n_posts": len(posts),
-            "churn_signal_rate": round(leaving / len(posts), 4) if posts else 0.0,
+            "churn_signal_rate": round(churn, 4),
             "tier1_baseline_shock": shocks.get(persona),
         }
+        if posts and "stance" in posts[0]:
+            stances: dict[str, int] = {}
+            for p in posts:
+                stances[p["stance"]] = stances.get(p["stance"], 0) + 1
+            entry["stances"] = dict(sorted(stances.items(), key=lambda kv: -kv[1]))
+        breakdown[persona] = entry
 
     final_sentiment = curve[-1]["avg_sentiment"] if curve else 0.0
 
@@ -212,7 +272,10 @@ def extract_report(
         "breakdown_by_persona": breakdown,
         "cascade": cascade,
         "n_posts": len(scored_posts),
-        "n_comments": len(tables["comment"]),
+        "n_utterances": len(scored_posts),
+        "n_original_posts": sum(1 for p in scored_posts if p["kind"] == "post"),
+        "n_reposts": n_reposts,
+        "n_comments": sum(1 for p in scored_posts if p["kind"] == "comment"),
         "n_trace_events": len(tables["trace"]),
         "posts": scored_posts,
         "cost": (manifest or {}).get("cost"),

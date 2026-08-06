@@ -1,0 +1,12 @@
+anthropic
+praw
+nltk
+neo4j
+zep-cloud
+streamlit
+plotly
+pandas
+numpy
+pyyaml
+python-dotenv
+pytest

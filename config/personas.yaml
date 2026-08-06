@@ -1,0 +1,40 @@
+personas:
+  loyal:
+    susceptibility: 0.2
+    churn_elasticity: 0.1
+    post_probability: 0.15
+    post_variance: 0.10
+    reach_range: [50, 500]
+    count_fraction: 0.30
+
+  casual:
+    susceptibility: 0.45
+    churn_elasticity: 0.35
+    post_probability: 0.20
+    post_variance: 0.15
+    reach_range: [50, 1000]
+    count_fraction: 0.25
+
+  deal_seeker:
+    susceptibility: 0.80
+    churn_elasticity: 0.60
+    post_probability: 0.40
+    post_variance: 0.30
+    reach_range: [100, 5000]
+    count_fraction: 0.20
+
+  influencer:
+    susceptibility: 0.50
+    churn_elasticity: 0.30
+    post_probability: 1.00
+    post_variance: 0.10
+    reach_range: [10000, 100000]
+    count_fraction: 0.10
+
+  sustainability:
+    susceptibility: 0.55
+    churn_elasticity: 0.40
+    post_probability: 0.25
+    post_variance: 0.20
+    reach_range: [200, 8000]
+    count_fraction: 0.15
